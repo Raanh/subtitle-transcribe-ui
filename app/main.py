@@ -1481,6 +1481,19 @@ def api_remove(queue_id: int) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/api/queue/cleanup-completed")
+def api_cleanup_completed() -> dict[str, Any]:
+    conn = db_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM queue_items WHERE status='completed'")
+        removed = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "removed": int(removed or 0)}
+
+
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -1501,12 +1514,13 @@ INDEX_HTML = """
       --bad: #ff6b6b;
       --border: #30415f;
     }
-    body { margin:0; font-family: ui-sans-serif, system-ui, sans-serif; background: linear-gradient(180deg,#101a2a,#0d1320); color:var(--text); }
+    html, body { height: 100%; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, sans-serif; background: linear-gradient(180deg,#101a2a,#0d1320); color:var(--text); overflow:hidden; }
     a { color: #9ed3ff; text-decoration: none; }
     a:hover { color: #dff1ff; text-decoration: underline; }
     a:visited { color: #b4dcff; }
-    .wrap { padding: 14px; display:grid; grid-template-columns: 1.4fr 1fr; gap: 12px; }
-    .panel { background: var(--panel); border:1px solid var(--border); border-radius: 10px; padding: 12px; }
+    .wrap { padding: 14px; display:grid; grid-template-columns: 1.4fr 1fr; gap: 12px; height: 100vh; box-sizing: border-box; }
+    .panel { background: var(--panel); border:1px solid var(--border); border-radius: 10px; padding: 12px; display:flex; flex-direction:column; min-height:0; }
     h2 { margin: 0 0 10px; font-size: 18px; }
     h3 { margin: 8px 0; font-size: 15px; color: var(--muted); }
     button { background: var(--panel2); color: var(--text); border:1px solid var(--border); border-radius:8px; padding: 6px 10px; cursor:pointer; }
@@ -1518,15 +1532,16 @@ INDEX_HTML = """
     .badge { padding: 2px 6px; border-radius: 999px; font-size: 11px; font-weight: 600; }
     .yes { background: rgba(46,204,113,.15); color: var(--ok); border: 1px solid rgba(46,204,113,.3); }
     .no { background: rgba(255,107,107,.15); color: var(--bad); border: 1px solid rgba(255,107,107,.3); }
-    .table-wrap { max-height: 300px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
+    .table-wrap { flex:1; min-height: 240px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
     table { width:100%; border-collapse: collapse; font-size: 12px; }
     th, td { border-bottom:1px solid var(--border); padding: 6px; text-align:left; vertical-align: top; }
     th { position: sticky; top:0; background: #1a2740; z-index: 1; }
-    .queue-wrap { max-height: 340px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
+    .queue-wrap { flex:1; min-height: 260px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
     .tabs { display:flex; gap: 8px; margin-bottom: 10px; }
     .tab { padding: 6px 10px; border:1px solid var(--border); border-radius:999px; cursor:pointer; }
     .tab.active { border-color: var(--accent); color: var(--accent); }
     .hidden { display:none; }
+    .pane { display:flex; flex-direction:column; min-height:0; flex:1; }
     .root-btn.active { border-color: var(--accent); color: var(--accent); }
     .status { font-weight: 700; text-transform: lowercase; }
     .status.completed { color: var(--ok); }
@@ -1547,13 +1562,15 @@ INDEX_HTML = """
         <label><input type="checkbox" id="fNoHr"> No HR</label>
         <label><input type="checkbox" id="fHasHr"> Has HR</label>
         <button onclick="refreshBrowse()">Apply</button>
+        <button onclick="selectAllVisible()">Select All Visible</button>
+        <button onclick="clearSelection()">Clear Selection</button>
       </div>
       <div class="row muted" id="breadcrumbs"></div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th></th><th>Name</th><th>Folder</th><th>EN</th><th>HR</th><th>Size MB</th><th>Actions</th>
+              <th><input type="checkbox" id="chkAll" title="Select all visible"></th><th>Name</th><th>Folder</th><th>EN</th><th>HR</th><th>Size MB</th><th>Actions</th>
             </tr>
           </thead>
           <tbody id="folderRows"></tbody>
@@ -1576,8 +1593,11 @@ INDEX_HTML = """
           <div class="tab" id="tabSettings" onclick="showTab('settings')">Settings</div>
         </div>
 
-        <div id="paneQueue">
-          <h3>Queue</h3>
+        <div id="paneQueue" class="pane">
+          <div class="row" style="justify-content:space-between;">
+            <h3>Queue</h3>
+            <button onclick="cleanupCompleted()">Clean Completed</button>
+          </div>
           <div class="queue-wrap">
             <table>
               <thead>
@@ -1588,7 +1608,7 @@ INDEX_HTML = """
           </div>
         </div>
 
-        <div id="paneHistory" class="hidden">
+        <div id="paneHistory" class="hidden pane">
           <h3>History</h3>
           <div class="queue-wrap">
             <table>
@@ -1600,7 +1620,7 @@ INDEX_HTML = """
           </div>
         </div>
 
-        <div id="paneSettings" class="hidden">
+        <div id="paneSettings" class="hidden pane">
           <h3>Settings</h3>
           <div class="row"><label>OpenAI key:</label><input id="sApiKey" type="password" style="min-width:320px;"></div>
           <div class="row muted" id="apiMask"></div>
@@ -1652,7 +1672,13 @@ INDEX_HTML = """
         const btn = document.createElement("button");
         btn.className = "root-btn" + (key===currentRoot ? " active" : "");
         btn.textContent = `${key.toUpperCase()}`;
-        btn.onclick = () => { currentRoot = key; currentRelPath = ""; refreshBrowse(); loadRoots(); };
+        btn.onclick = () => {
+          currentRoot = key;
+          currentRelPath = "";
+          document.getElementById("searchInput").value = "";
+          refreshBrowse();
+          loadRoots();
+        };
         rootButtons.appendChild(btn);
       }
     }
@@ -1691,6 +1717,8 @@ INDEX_HTML = """
           </td>
         </tr>`;
       }
+      const chkAll = document.getElementById("chkAll");
+      if(chkAll) chkAll.checked = false;
     }
 
     function selectedItems(){
@@ -1700,7 +1728,20 @@ INDEX_HTML = """
 
     function gotoPath(rel){
       currentRelPath = rel || "";
+      document.getElementById("searchInput").value = "";
       refreshBrowse();
+    }
+
+    function selectAllVisible(){
+      document.querySelectorAll(".fileChk").forEach(el => { el.checked = true; });
+      const chkAll = document.getElementById("chkAll");
+      if(chkAll) chkAll.checked = true;
+    }
+
+    function clearSelection(){
+      document.querySelectorAll(".fileChk").forEach(el => { el.checked = false; });
+      const chkAll = document.getElementById("chkAll");
+      if(chkAll) chkAll.checked = false;
     }
 
     async function estimateSelected(){
@@ -1837,6 +1878,12 @@ INDEX_HTML = """
       await refreshQueue();
     }
 
+    async function cleanupCompleted(){
+      const res = await api("/api/queue/cleanup-completed", { method:"POST" });
+      alert(`Removed ${res.removed} completed item(s).`);
+      await refreshQueue();
+    }
+
     async function loadSettings(){
       const s = await api("/api/settings");
       document.getElementById("apiMask").innerText = s.openai_api_key_set ? `Stored key: ${s.openai_api_key_masked}` : "No API key saved";
@@ -1883,6 +1930,18 @@ INDEX_HTML = """
     }
 
     async function boot(){
+      const searchInput = document.getElementById("searchInput");
+      searchInput.addEventListener("keydown", async (e) => {
+        if(e.key === "Enter"){
+          e.preventDefault();
+          await refreshBrowse();
+        }
+      });
+      const chkAll = document.getElementById("chkAll");
+      chkAll.addEventListener("change", () => {
+        const checked = !!chkAll.checked;
+        document.querySelectorAll(".fileChk").forEach(el => { el.checked = checked; });
+      });
       await loadSettings();
       await loadRoots();
       await refreshBrowse();
