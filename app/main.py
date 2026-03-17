@@ -34,13 +34,23 @@ VIDEO_EXTENSIONS = {
     ".webm",
 }
 
-ACTIVE_STATUSES = {"preparing", "extracting audio", "transcribing", "writing srt"}
+ACTIVE_STATUSES = {
+    "preparing",
+    "extracting audio",
+    "transcribing",
+    "writing srt",
+    "loading english subtitle",
+    "translating",
+    "writing hr srt",
+}
 EN_PATTERN = re.compile(r"(^|[._ \-])(en|eng|english)([._ \-]|$)", re.IGNORECASE)
 HR_PATTERN = re.compile(r"(^|[._ \-])(hr|hrv|cro|croatian)([._ \-]|$)", re.IGNORECASE)
 
 DEFAULT_SETTINGS = {
     "openai_api_key": "",
     "openai_model": "whisper-1",
+    "translation_model": "gpt-4o-mini",
+    "translation_chunk_size": "80",
     "price_per_minute_usd": "0.006",
     "concurrency_limit": "1",
     "overwrite_openai_outputs": "0",
@@ -107,6 +117,7 @@ def init_db() -> None:
                 rel_path TEXT NOT NULL,
                 abs_path TEXT NOT NULL,
                 filename TEXT NOT NULL,
+                job_type TEXT NOT NULL DEFAULT 'transcribe_en',
                 status TEXT NOT NULL,
                 current_step TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -117,6 +128,9 @@ def init_db() -> None:
                 estimated_minutes REAL,
                 estimated_cost_usd REAL,
                 eta_seconds REAL,
+                source_subtitle_path TEXT,
+                hr_subtitle_existed INTEGER NOT NULL DEFAULT 0,
+                alternate_output_used INTEGER NOT NULL DEFAULT 0,
                 output_subtitle_path TEXT,
                 synced_subtitle_path TEXT,
                 error_message TEXT
@@ -129,17 +143,44 @@ def init_db() -> None:
                 rel_path TEXT,
                 abs_path TEXT,
                 filename TEXT,
+                job_type TEXT,
                 status TEXT,
                 finished_at TEXT,
                 elapsed_seconds REAL,
                 estimated_minutes REAL,
                 estimated_cost_usd REAL,
+                source_subtitle_path TEXT,
+                hr_subtitle_existed INTEGER,
+                alternate_output_used INTEGER,
                 output_subtitle_path TEXT,
                 synced_subtitle_path TEXT,
                 error_message TEXT
             );
             """
         )
+        ensure_column(
+            conn,
+            "queue_items",
+            "job_type",
+            "TEXT NOT NULL DEFAULT 'transcribe_en'",
+        )
+        ensure_column(conn, "queue_items", "source_subtitle_path", "TEXT")
+        ensure_column(
+            conn,
+            "queue_items",
+            "hr_subtitle_existed",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        ensure_column(
+            conn,
+            "queue_items",
+            "alternate_output_used",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        ensure_column(conn, "history", "job_type", "TEXT")
+        ensure_column(conn, "history", "source_subtitle_path", "TEXT")
+        ensure_column(conn, "history", "hr_subtitle_existed", "INTEGER")
+        ensure_column(conn, "history", "alternate_output_used", "INTEGER")
         conn.commit()
     finally:
         conn.close()
@@ -152,6 +193,21 @@ def init_db() -> None:
         current = get_setting("openai_api_key", "")
         if not current:
             save_setting("openai_api_key", env_key)
+
+
+def ensure_column(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name in existing:
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
 
 
 def set_setting_if_missing(key: str, value: str) -> None:
@@ -274,6 +330,103 @@ def subtitle_presence(video_path: Path) -> tuple[bool, bool, list[str], list[str
     return bool(en_hits), bool(hr_hits), en_hits, hr_hits
 
 
+def find_best_generated_en_subtitle(video_path: Path) -> Path | None:
+    base = video_path.with_suffix("")
+    preferred = Path(str(base) + ".openai.synced.en.srt")
+    if preferred.exists():
+        return preferred
+
+    secondary = Path(str(base) + ".openai.en.srt")
+    if secondary.exists():
+        return secondary
+
+    pattern = f"{video_path.stem}.openai*.en.srt"
+    candidates = [
+        p
+        for p in video_path.parent.glob(pattern)
+        if p.is_file() and ".openai." in p.name.lower()
+    ]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def parse_srt_entries(srt_text: str) -> list[dict[str, Any]]:
+    blocks = re.split(r"\r?\n\r?\n+", srt_text.strip())
+    entries: list[dict[str, Any]] = []
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) < 2 or "-->" not in lines[1]:
+            continue
+        entries.append(
+            {
+                "index": lines[0].strip(),
+                "timestamp": lines[1].rstrip(),
+                "text_lines": lines[2:] if len(lines) > 2 else [""],
+            }
+        )
+    return entries
+
+
+def render_srt_entries(entries: list[dict[str, Any]]) -> str:
+    blocks: list[str] = []
+    for entry in entries:
+        text_lines = entry.get("text_lines") or [""]
+        block = [str(entry.get("index", "")).strip(), str(entry.get("timestamp", "")).strip()]
+        block.extend([str(line) for line in text_lines])
+        blocks.append("\n".join(block).rstrip())
+    rendered = "\n\n".join(blocks).strip()
+    return rendered + ("\n" if rendered else "")
+
+
+def translate_lines_batch(
+    client: OpenAI,
+    model: str,
+    lines: list[str],
+) -> list[str]:
+    if not lines:
+        return []
+
+    system_prompt = (
+        "You translate English subtitle lines to Croatian. "
+        "Return only JSON in the form {\"translations\":[...]} with the exact same number of items. "
+        "Preserve subtitle brevity, punctuation, speaker markers, and tags."
+    )
+    user_prompt = (
+        "Translate each input line to Croatian. Keep ordering exactly the same.\n"
+        f"INPUT_LINES_JSON={json_safe_dump(lines)}"
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    content = resp.choices[0].message.content or ""
+    data = json_safe_load(content)
+    translated = data.get("translations")
+    if not isinstance(translated, list) or len(translated) != len(lines):
+        raise RuntimeError("Unexpected translation output format from OpenAI")
+    return [str(x) for x in translated]
+
+
+def json_safe_dump(value: Any) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def json_safe_load(value: str) -> dict[str, Any]:
+    import json
+
+    return json.loads(value)
+
+
 def parse_duration_minutes(video_path: Path) -> float:
     ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     proc = subprocess.run(
@@ -340,6 +493,11 @@ def add_queue_item(
     abs_path: Path,
     estimated_minutes: float | None,
     estimated_cost_usd: float | None,
+    *,
+    job_type: str = "transcribe_en",
+    source_subtitle_path: str | None = None,
+    hr_subtitle_existed: int = 0,
+    alternate_output_used: int = 0,
 ) -> int:
     now = now_utc_iso()
     conn = db_conn()
@@ -349,19 +507,25 @@ def add_queue_item(
             """
             INSERT INTO queue_items(
                 root_key, rel_path, abs_path, filename,
+                job_type,
                 status, current_step, created_at, updated_at,
-                estimated_minutes, estimated_cost_usd
-            ) VALUES(?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)
+                estimated_minutes, estimated_cost_usd,
+                source_subtitle_path, hr_subtitle_existed, alternate_output_used
+            ) VALUES(?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 root_key,
                 rel_path,
                 str(abs_path),
                 abs_path.name,
+                job_type,
                 now,
                 now,
                 estimated_minutes,
                 estimated_cost_usd,
+                source_subtitle_path,
+                int(hr_subtitle_existed),
+                int(alternate_output_used),
             ),
         )
         conn.commit()
@@ -406,6 +570,9 @@ def update_queue_item(
     *,
     status: str | None = None,
     current_step: str | None = None,
+    source_subtitle_path: str | None = None,
+    hr_subtitle_existed: int | None = None,
+    alternate_output_used: int | None = None,
     output_subtitle_path: str | None = None,
     synced_subtitle_path: str | None = None,
     error_message: str | None = None,
@@ -418,6 +585,15 @@ def update_queue_item(
     if current_step is not None:
         fields.append("current_step=?")
         values.append(current_step)
+    if source_subtitle_path is not None:
+        fields.append("source_subtitle_path=?")
+        values.append(source_subtitle_path)
+    if hr_subtitle_existed is not None:
+        fields.append("hr_subtitle_existed=?")
+        values.append(int(hr_subtitle_existed))
+    if alternate_output_used is not None:
+        fields.append("alternate_output_used=?")
+        values.append(int(alternate_output_used))
     if output_subtitle_path is not None:
         fields.append("output_subtitle_path=?")
         values.append(output_subtitle_path)
@@ -477,8 +653,9 @@ def complete_queue_item(queue_id: int, status: str, error_message: str | None = 
                 INSERT INTO history(
                     queue_item_id, root_key, rel_path, abs_path, filename, status, finished_at,
                     elapsed_seconds, estimated_minutes, estimated_cost_usd,
+                    job_type, source_subtitle_path, hr_subtitle_existed, alternate_output_used,
                     output_subtitle_path, synced_subtitle_path, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row2["id"],
@@ -491,6 +668,10 @@ def complete_queue_item(queue_id: int, status: str, error_message: str | None = 
                     row2["elapsed_seconds"],
                     row2["estimated_minutes"],
                     row2["estimated_cost_usd"],
+                    row2["job_type"],
+                    row2["source_subtitle_path"],
+                    row2["hr_subtitle_existed"],
+                    row2["alternate_output_used"],
                     row2["output_subtitle_path"],
                     row2["synced_subtitle_path"],
                     row2["error_message"],
@@ -508,6 +689,20 @@ def build_output_path(video_path: Path, overwrite_openai: bool) -> Path:
         return preferred
     suffix = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path(str(base) + f".openai.{suffix}.en.srt")
+
+
+def build_hr_output_path(video_path: Path, force_alternate: bool) -> tuple[Path, bool]:
+    base = video_path.with_suffix("")
+    preferred = Path(str(base) + ".openai.hr.srt")
+    if not preferred.exists() and not force_alternate:
+        return preferred, False
+
+    alt = Path(str(base) + ".openai.alt.hr.srt")
+    if not alt.exists():
+        return alt, True
+
+    suffix = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path(str(base) + f".openai.alt.{suffix}.hr.srt"), True
 
 
 def run_subtitle_sync(video_path: Path, input_srt: Path, logger: logging.Logger) -> Path | None:
@@ -545,6 +740,71 @@ def run_subtitle_sync(video_path: Path, input_srt: Path, logger: logging.Logger)
     return synced_path
 
 
+def process_translation_job(item: dict[str, Any], logger: logging.Logger) -> tuple[str, str, int]:
+    queue_id = int(item["id"])
+    video_path = Path(item["abs_path"])
+    source_subtitle = item.get("source_subtitle_path") or ""
+    source_path = Path(source_subtitle) if source_subtitle else find_best_generated_en_subtitle(video_path)
+    if not source_path or not source_path.exists():
+        raise RuntimeError("Missing generated English subtitle (.openai.en.srt)")
+
+    settings = get_settings()
+    api_key = settings.get("openai_api_key", "").strip()
+    if not api_key:
+        raise RuntimeError("OpenAI API key is not configured in settings")
+
+    update_queue_item(
+        queue_id,
+        status="loading english subtitle",
+        current_step="loading english subtitle",
+        source_subtitle_path=str(source_path),
+    )
+    source_text = source_path.read_text(encoding="utf-8", errors="replace")
+    entries = parse_srt_entries(source_text)
+    if not entries:
+        raise RuntimeError("Input EN subtitle is not a valid SRT file")
+
+    text_indexes = [
+        idx
+        for idx, entry in enumerate(entries)
+        if any(line.strip() for line in (entry.get("text_lines") or []))
+    ]
+    if not text_indexes:
+        raise RuntimeError("Input EN subtitle does not contain translatable text")
+
+    client = OpenAI(api_key=api_key)
+    model = settings.get("translation_model", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    chunk_size = max(10, min(200, int_setting("translation_chunk_size", 80)))
+    total = len(text_indexes)
+    translated_done = 0
+
+    for start in range(0, total, chunk_size):
+        update_queue_item(
+            queue_id,
+            status="translating",
+            current_step=f"translating ({min(start, total)}/{total})",
+        )
+        batch_indexes = text_indexes[start : start + chunk_size]
+        batch_texts = ["\n".join(entries[i]["text_lines"]).strip() for i in batch_indexes]
+        translated = translate_lines_batch(client, model, batch_texts)
+        for entry_idx, translated_text in zip(batch_indexes, translated):
+            translated_lines = [line.rstrip() for line in translated_text.splitlines()]
+            entries[entry_idx]["text_lines"] = translated_lines or [""]
+        translated_done += len(batch_indexes)
+        update_queue_item(
+            queue_id,
+            status="translating",
+            current_step=f"translating ({translated_done}/{total})",
+        )
+
+    update_queue_item(queue_id, status="writing hr srt", current_step="writing hr srt")
+    force_alt = int(item.get("hr_subtitle_existed") or 0) == 1
+    output_path, used_alt = build_hr_output_path(video_path, force_alternate=force_alt)
+    output_path.write_text(render_srt_entries(entries), encoding="utf-8")
+
+    return str(source_path), str(output_path), int(used_alt)
+
+
 def process_queue_item(item: dict[str, Any], logger: logging.Logger) -> None:
     queue_id = int(item["id"])
     video_path = Path(item["abs_path"])
@@ -553,10 +813,23 @@ def process_queue_item(item: dict[str, Any], logger: logging.Logger) -> None:
     warning: str | None = None
 
     try:
+        job_type = str(item.get("job_type") or "transcribe_en")
         if not video_path.exists():
             raise RuntimeError(f"Source file missing: {video_path}")
         if video_path.suffix.lower() not in VIDEO_EXTENSIONS:
             raise RuntimeError(f"Unsupported media extension: {video_path.suffix}")
+
+        if job_type == "translate_hr":
+            source_path, output_path, used_alt = process_translation_job(item, logger)
+            update_queue_item(
+                queue_id,
+                source_subtitle_path=source_path,
+                output_subtitle_path=output_path,
+                alternate_output_used=used_alt,
+            )
+            complete_queue_item(queue_id, "completed", None)
+            logger.info("Queue %s completed (translate_hr): %s", queue_id, video_path)
+            return
 
         settings = get_settings()
         api_key = settings.get("openai_api_key", "").strip()
@@ -635,14 +908,16 @@ def process_queue_item(item: dict[str, Any], logger: logging.Logger) -> None:
 
 
 def count_active_jobs() -> int:
+    placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
     conn = db_conn()
     try:
         row = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS c
             FROM queue_items
-            WHERE status IN ('preparing', 'extracting audio', 'transcribing', 'writing srt')
-            """
+            WHERE status IN ({placeholders})
+            """,
+            tuple(ACTIVE_STATUSES),
         ).fetchone()
         return int(row["c"]) if row else 0
     finally:
@@ -678,6 +953,8 @@ def worker_loop(stop_event: threading.Event, logger: logging.Logger) -> None:
 class SettingsUpdate(BaseModel):
     openai_api_key: str | None = None
     openai_model: str = "whisper-1"
+    translation_model: str = "gpt-4o-mini"
+    translation_chunk_size: int = 80
     price_per_minute_usd: float = 0.006
     concurrency_limit: int = 1
     overwrite_openai_outputs: bool = False
@@ -698,6 +975,11 @@ class EstimateRequest(BaseModel):
 
 class AddQueueRequest(BaseModel):
     items: list[QueueItemInput] = Field(default_factory=list)
+
+
+class AddHrTranslationRequest(BaseModel):
+    items: list[QueueItemInput] = Field(default_factory=list)
+    confirm_existing_hr: bool = False
 
 
 class AddFolderRequest(BaseModel):
@@ -752,6 +1034,8 @@ def api_get_settings() -> dict[str, Any]:
         "openai_api_key_masked": masked,
         "openai_api_key_set": bool(key),
         "openai_model": settings.get("openai_model", "whisper-1"),
+        "translation_model": settings.get("translation_model", "gpt-4o-mini"),
+        "translation_chunk_size": int_setting("translation_chunk_size", 80),
         "price_per_minute_usd": float_setting("price_per_minute_usd", 0.006),
         "concurrency_limit": int_setting("concurrency_limit", 1),
         "overwrite_openai_outputs": bool_setting("overwrite_openai_outputs", False),
@@ -768,6 +1052,8 @@ def api_save_settings(payload: SettingsUpdate) -> dict[str, Any]:
         if payload.openai_api_key.strip():
             save_setting("openai_api_key", payload.openai_api_key.strip())
     save_setting("openai_model", payload.openai_model.strip() or "whisper-1")
+    save_setting("translation_model", payload.translation_model.strip() or "gpt-4o-mini")
+    save_setting("translation_chunk_size", str(max(10, min(payload.translation_chunk_size, 200))))
     save_setting("price_per_minute_usd", f"{max(payload.price_per_minute_usd, 0.0):.6f}")
     save_setting("concurrency_limit", str(max(payload.concurrency_limit, 1)))
     save_setting("overwrite_openai_outputs", "1" if payload.overwrite_openai_outputs else "0")
@@ -814,6 +1100,7 @@ def api_browse(
             continue
 
         has_en_sub, has_hr_sub, en_files, hr_files = subtitle_presence(entry)
+        generated_en = find_best_generated_en_subtitle(entry)
         if no_en and has_en_sub:
             continue
         if has_en and not has_en_sub:
@@ -834,6 +1121,8 @@ def api_browse(
                 "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                 "has_en_subtitle": has_en_sub,
                 "has_hr_subtitle": has_hr_sub,
+                "has_generated_en_subtitle": bool(generated_en),
+                "generated_en_subtitle_path": str(generated_en) if generated_en else "",
                 "en_files": en_files,
                 "hr_files": hr_files,
             }
@@ -923,6 +1212,61 @@ def api_queue_add(payload: AddQueueRequest) -> dict[str, Any]:
         created += 1
 
     return {"ok": True, "created": created, "queue_ids": ids}
+
+
+@app.post("/api/queue/add-translate-hr")
+def api_queue_add_translate_hr(payload: AddHrTranslationRequest) -> dict[str, Any]:
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="No items selected")
+
+    created = 0
+    ids: list[int] = []
+    skipped_missing_en: list[dict[str, Any]] = []
+    requires_confirmation: list[dict[str, Any]] = []
+
+    for item in payload.items:
+        video = resolve_video_path(item.root_key, item.rel_path)
+        if not video.exists() or not video.is_file():
+            continue
+        if video.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+
+        _, has_hr_sub, _, hr_files = subtitle_presence(video)
+        source_en = find_best_generated_en_subtitle(video)
+        if not source_en:
+            skipped_missing_en.append({"rel_path": item.rel_path, "reason": "missing_generated_en"})
+            continue
+
+        if has_hr_sub and not payload.confirm_existing_hr:
+            requires_confirmation.append(
+                {
+                    "rel_path": item.rel_path,
+                    "hr_files": hr_files,
+                }
+            )
+            continue
+
+        new_id = add_queue_item(
+            item.root_key,
+            item.rel_path,
+            video,
+            None,
+            None,
+            job_type="translate_hr",
+            source_subtitle_path=str(source_en),
+            hr_subtitle_existed=1 if has_hr_sub else 0,
+            alternate_output_used=1 if has_hr_sub else 0,
+        )
+        ids.append(new_id)
+        created += 1
+
+    return {
+        "ok": True,
+        "created": created,
+        "queue_ids": ids,
+        "requires_confirmation": requires_confirmation,
+        "skipped_missing_generated_en": skipped_missing_en,
+    }
 
 
 @app.post("/api/queue/add-folder")
@@ -1059,6 +1403,7 @@ INDEX_HTML = """
     .status.completed { color: var(--ok); }
     .status.failed { color: var(--bad); }
     .status.transcribing { color: var(--accent); }
+    .status.translating { color: var(--accent); }
   </style>
 </head>
 <body>
@@ -1079,7 +1424,7 @@ INDEX_HTML = """
         <table>
           <thead>
             <tr>
-              <th></th><th>Name</th><th>Folder</th><th>EN</th><th>HR</th><th>Size MB</th>
+              <th></th><th>Name</th><th>Folder</th><th>EN</th><th>HR</th><th>Size MB</th><th>Actions</th>
             </tr>
           </thead>
           <tbody id="folderRows"></tbody>
@@ -1087,7 +1432,8 @@ INDEX_HTML = """
       </div>
       <div class="row" style="margin-top:10px;">
         <button onclick="estimateSelected()">Estimate Cost</button>
-        <button onclick="queueSelected()">Queue Selected</button>
+        <button onclick="queueSelected()">Generate EN (Selected)</button>
+        <button onclick="translateSelectedToHr()">Translate to HR (Selected)</button>
         <button onclick="queueCurrentFolder()">Queue Current Folder (Confirm)</button>
       </div>
       <div id="estimateBox" class="muted"></div>
@@ -1106,7 +1452,7 @@ INDEX_HTML = """
           <div class="queue-wrap">
             <table>
               <thead>
-                <tr><th>ID</th><th>File</th><th>Status</th><th>Step</th><th>Elapsed</th><th>ETA</th><th>Output</th><th></th></tr>
+                <tr><th>ID</th><th>Type</th><th>File</th><th>Status</th><th>Step</th><th>Elapsed</th><th>ETA</th><th>Output</th><th></th></tr>
               </thead>
               <tbody id="queueRows"></tbody>
             </table>
@@ -1118,7 +1464,7 @@ INDEX_HTML = """
           <div class="queue-wrap">
             <table>
               <thead>
-                <tr><th>When</th><th>File</th><th>Status</th><th>Elapsed</th><th>Cost</th><th>Output</th><th>Error</th></tr>
+                <tr><th>When</th><th>Type</th><th>File</th><th>Status</th><th>Elapsed</th><th>Cost</th><th>Output</th><th>Error</th></tr>
               </thead>
               <tbody id="historyRows"></tbody>
             </table>
@@ -1131,6 +1477,8 @@ INDEX_HTML = """
           <div class="row muted" id="apiMask"></div>
           <div class="row">
             <label>Model:</label><input id="sModel" value="whisper-1">
+            <label>Translate model:</label><input id="sTranslationModel" value="gpt-4o-mini">
+            <label>HR chunk size:</label><input id="sTransChunk" type="number" value="80" min="10" max="200" style="width:90px;">
             <label>USD/min:</label><input id="sPrice" type="number" step="0.0001" value="0.006">
             <label>Concurrency:</label><input id="sConc" type="number" value="1" min="1" max="4" style="width:80px;">
           </div>
@@ -1195,16 +1543,22 @@ INDEX_HTML = """
       const rows = document.getElementById("folderRows");
       rows.innerHTML = "";
       for(const f of data.folders){
-        rows.innerHTML += `<tr><td></td><td><a href="#" onclick="gotoPath('${esc(f.rel_path)}');return false;">📁 ${esc(f.name)}</a></td><td>${esc(f.rel_path)}</td><td></td><td></td><td></td></tr>`;
+        rows.innerHTML += `<tr><td></td><td><a href="#" onclick="gotoPath('${esc(f.rel_path)}');return false;">📁 ${esc(f.name)}</a></td><td>${esc(f.rel_path)}</td><td></td><td></td><td></td><td></td></tr>`;
       }
       for(const f of data.files){
+        const relEnc = encodeURIComponent(f.rel_path);
+        const enState = f.has_generated_en_subtitle ? "YES (openai)" : (f.has_en_subtitle ? "YES" : "NO");
         rows.innerHTML += `<tr>
           <td><input type="checkbox" class="fileChk" data-rel="${esc(f.rel_path)}"></td>
           <td>🎬 ${esc(f.name)}</td>
           <td>${esc(f.folder)}</td>
-          <td><span class="badge ${f.has_en_subtitle ? "yes":"no"}">${f.has_en_subtitle ? "YES":"NO"}</span></td>
+          <td><span class="badge ${f.has_en_subtitle ? "yes":"no"}">${enState}</span></td>
           <td><span class="badge ${f.has_hr_subtitle ? "yes":"no"}">${f.has_hr_subtitle ? "YES":"NO"}</span></td>
           <td>${f.size_mb}</td>
+          <td>
+            <button onclick="queueSingleEn('${relEnc}')">Generate EN</button>
+            <button onclick="translateSingleToHr('${relEnc}')" ${f.has_generated_en_subtitle ? "" : "disabled"}>Translate to HR</button>
+          </td>
         </tr>`;
       }
     }
@@ -1239,6 +1593,50 @@ INDEX_HTML = """
       await refreshQueue();
     }
 
+    async function queueSingleEn(relEnc){
+      const rel = decodeURIComponent(relEnc);
+      const res = await api("/api/queue/add", { method:"POST", body: JSON.stringify({ items: [{ root_key: currentRoot, rel_path: rel }] }) });
+      alert(`Queued ${res.created} EN transcription job.`);
+      await refreshQueue();
+    }
+
+    async function queueHrTranslationJobs(items, confirmExistingHr){
+      const res = await api("/api/queue/add-translate-hr", {
+        method:"POST",
+        body: JSON.stringify({ items, confirm_existing_hr: !!confirmExistingHr })
+      });
+      const missing = (res.skipped_missing_generated_en || []).length;
+      const pendingConfirm = (res.requires_confirmation || []).length;
+      alert(`Queued ${res.created} HR translation job(s).\\nMissing generated EN: ${missing}\\nNeeds HR confirmation: ${pendingConfirm}`);
+      await refreshQueue();
+    }
+
+    async function translateSelectedToHr(){
+      const items = selectedItems();
+      if(!items.length){ alert("Select at least one file."); return; }
+      const selectedMap = new Map(currentFiles.map(f => [f.rel_path, f]));
+      const hasExistingHr = items.some(it => (selectedMap.get(it.rel_path) || {}).has_hr_subtitle);
+      let confirmExistingHr = false;
+      if(hasExistingHr){
+        confirmExistingHr = confirm("Some selected files already have HR subtitles.\\nExisting HR will NOT be overwritten; alternate .openai.alt.hr.srt files will be created.\\nContinue?");
+      }
+      await queueHrTranslationJobs(items, confirmExistingHr);
+    }
+
+    async function translateSingleToHr(relEnc){
+      const rel = decodeURIComponent(relEnc);
+      const file = currentFiles.find(f => f.rel_path === rel);
+      if(!file || !file.has_generated_en_subtitle){
+        alert("Generated EN subtitle (.openai.en.srt/.openai.synced.en.srt) is required first.");
+        return;
+      }
+      let confirmExistingHr = false;
+      if(file.has_hr_subtitle){
+        confirmExistingHr = confirm("HR subtitle already exists.\\nCreate alternate .openai.alt.hr.srt instead of overwrite?");
+      }
+      await queueHrTranslationJobs([{ root_key: currentRoot, rel_path: rel }], confirmExistingHr);
+    }
+
     async function queueCurrentFolder(){
       const ok = confirm(`Queue ALL video files in current folder path (${currentRelPath || "/"}) recursively?`);
       if(!ok) return;
@@ -1255,14 +1653,20 @@ INDEX_HTML = """
       const rows = document.getElementById("queueRows");
       rows.innerHTML = "";
       for(const q of data.items){
+        const jobType = q.job_type === "translate_hr" ? "translate_hr" : "transcribe_en";
         rows.innerHTML += `<tr>
           <td>${q.id}</td>
+          <td>${esc(jobType)}</td>
           <td>${esc(q.filename)}<div class="muted">${esc(q.rel_path)}</div></td>
           <td><span class="status ${esc(q.status)}">${esc(q.status)}</span></td>
           <td>${esc(q.current_step || "")}</td>
           <td>${fmtSec(q.elapsed_seconds)}</td>
           <td>${fmtSec(q.eta_seconds)}</td>
-          <td>${esc(q.synced_subtitle_path || q.output_subtitle_path || "")}</td>
+          <td>
+            ${esc(q.synced_subtitle_path || q.output_subtitle_path || "")}
+            ${q.source_subtitle_path ? `<div class="muted">src: ${esc(q.source_subtitle_path)}</div>` : ""}
+            ${q.alternate_output_used ? `<div class="muted">alternate HR output used</div>` : ""}
+          </td>
           <td>
             ${q.status==="queued" ? `<button onclick="removeQueue(${q.id})">Remove</button>` : ""}
             ${q.status==="failed" ? `<button onclick="retryQueue(${q.id})">Retry</button>` : ""}
@@ -1276,13 +1680,19 @@ INDEX_HTML = """
       const rows = document.getElementById("historyRows");
       rows.innerHTML = "";
       for(const h of data.items){
+        const jobType = h.job_type === "translate_hr" ? "translate_hr" : "transcribe_en";
         rows.innerHTML += `<tr>
           <td>${esc(h.finished_at || "")}</td>
+          <td>${esc(jobType)}</td>
           <td>${esc(h.filename || "")}<div class="muted">${esc(h.rel_path || "")}</div></td>
           <td>${esc(h.status || "")}</td>
           <td>${fmtSec(h.elapsed_seconds)}</td>
           <td>${h.estimated_cost_usd ? `$${h.estimated_cost_usd.toFixed ? h.estimated_cost_usd.toFixed(4) : h.estimated_cost_usd}` : ""}</td>
-          <td>${esc(h.synced_subtitle_path || h.output_subtitle_path || "")}</td>
+          <td>
+            ${esc(h.synced_subtitle_path || h.output_subtitle_path || "")}
+            ${h.source_subtitle_path ? `<div class="muted">src: ${esc(h.source_subtitle_path)}</div>` : ""}
+            ${h.alternate_output_used ? `<div class="muted">alternate HR output used</div>` : ""}
+          </td>
           <td class="muted">${esc(h.error_message || "")}</td>
         </tr>`;
       }
@@ -1301,6 +1711,8 @@ INDEX_HTML = """
       const s = await api("/api/settings");
       document.getElementById("apiMask").innerText = s.openai_api_key_set ? `Stored key: ${s.openai_api_key_masked}` : "No API key saved";
       document.getElementById("sModel").value = s.openai_model || "whisper-1";
+      document.getElementById("sTranslationModel").value = s.translation_model || "gpt-4o-mini";
+      document.getElementById("sTransChunk").value = s.translation_chunk_size ?? 80;
       document.getElementById("sPrice").value = s.price_per_minute_usd ?? 0.006;
       document.getElementById("sConc").value = s.concurrency_limit ?? 1;
       document.getElementById("sOverwrite").checked = !!s.overwrite_openai_outputs;
@@ -1314,6 +1726,8 @@ INDEX_HTML = """
       const payload = {
         openai_api_key: document.getElementById("sApiKey").value || null,
         openai_model: document.getElementById("sModel").value || "whisper-1",
+        translation_model: document.getElementById("sTranslationModel").value || "gpt-4o-mini",
+        translation_chunk_size: parseInt(document.getElementById("sTransChunk").value || "80", 10),
         price_per_minute_usd: parseFloat(document.getElementById("sPrice").value || "0.006"),
         concurrency_limit: parseInt(document.getElementById("sConc").value || "1", 10),
         overwrite_openai_outputs: document.getElementById("sOverwrite").checked,
