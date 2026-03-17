@@ -409,10 +409,8 @@ def translate_lines_batch(
     content = resp.choices[0].message.content or ""
     translated = parse_translation_payload(content)
     if len(translated) != len(lines):
-        raise RuntimeError(
-            "Unexpected translation output format from OpenAI "
-            f"(expected {len(lines)} lines, got {len(translated)})"
-        )
+        # Fallback for occasional model mismatch in batch JSON responses.
+        return [translate_single_line(client, model, line) for line in lines]
     return [str(x) for x in translated]
 
 
@@ -459,6 +457,25 @@ def parse_translation_payload(content: str) -> list[str]:
             return [str(x) for x in parsed]
 
     raise RuntimeError("OpenAI translation output is not valid JSON")
+
+
+def translate_single_line(client: OpenAI, model: str, text: str) -> str:
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Translate English subtitle text to Croatian. "
+                    "Return only translated text with no notes or markup."
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+    )
+    content = resp.choices[0].message.content or ""
+    return content.strip()
 
 
 def parse_duration_minutes(video_path: Path) -> float:
