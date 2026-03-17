@@ -50,7 +50,7 @@ DEFAULT_SETTINGS = {
     "openai_api_key": "",
     "openai_model": "whisper-1",
     "translation_model": "gpt-4o-mini",
-    "translation_chunk_size": "80",
+    "translation_chunk_size": "40",
     "price_per_minute_usd": "0.006",
     "concurrency_limit": "1",
     "overwrite_openai_outputs": "0",
@@ -401,17 +401,18 @@ def translate_lines_batch(
     resp = client.chat.completions.create(
         model=model,
         temperature=0,
-        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     )
     content = resp.choices[0].message.content or ""
-    data = json_safe_load(content)
-    translated = data.get("translations")
-    if not isinstance(translated, list) or len(translated) != len(lines):
-        raise RuntimeError("Unexpected translation output format from OpenAI")
+    translated = parse_translation_payload(content)
+    if len(translated) != len(lines):
+        raise RuntimeError(
+            "Unexpected translation output format from OpenAI "
+            f"(expected {len(lines)} lines, got {len(translated)})"
+        )
     return [str(x) for x in translated]
 
 
@@ -425,6 +426,39 @@ def json_safe_load(value: str) -> dict[str, Any]:
     import json
 
     return json.loads(value)
+
+
+def parse_translation_payload(content: str) -> list[str]:
+    payload = content.strip()
+    if not payload:
+        raise RuntimeError("Empty translation output from OpenAI")
+
+    # Strip simple markdown code fences if present.
+    if payload.startswith("```"):
+        payload = re.sub(r"^```[a-zA-Z0-9]*\n?", "", payload)
+        payload = re.sub(r"\n?```$", "", payload).strip()
+
+    candidates: list[str] = [payload]
+    first_obj = payload.find("{")
+    last_obj = payload.rfind("}")
+    if 0 <= first_obj < last_obj:
+        candidates.append(payload[first_obj : last_obj + 1])
+    first_arr = payload.find("[")
+    last_arr = payload.rfind("]")
+    if 0 <= first_arr < last_arr:
+        candidates.append(payload[first_arr : last_arr + 1])
+
+    for candidate in candidates:
+        try:
+            parsed = json_safe_load(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("translations"), list):
+            return [str(x) for x in parsed["translations"]]
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
+
+    raise RuntimeError("OpenAI translation output is not valid JSON")
 
 
 def parse_duration_minutes(video_path: Path) -> float:
@@ -774,7 +808,7 @@ def process_translation_job(item: dict[str, Any], logger: logging.Logger) -> tup
 
     client = OpenAI(api_key=api_key)
     model = settings.get("translation_model", "gpt-4o-mini").strip() or "gpt-4o-mini"
-    chunk_size = max(10, min(200, int_setting("translation_chunk_size", 80)))
+    chunk_size = max(10, min(200, int_setting("translation_chunk_size", 40)))
     total = len(text_indexes)
     translated_done = 0
 
@@ -954,7 +988,7 @@ class SettingsUpdate(BaseModel):
     openai_api_key: str | None = None
     openai_model: str = "whisper-1"
     translation_model: str = "gpt-4o-mini"
-    translation_chunk_size: int = 80
+    translation_chunk_size: int = 40
     price_per_minute_usd: float = 0.006
     concurrency_limit: int = 1
     overwrite_openai_outputs: bool = False
@@ -1035,7 +1069,7 @@ def api_get_settings() -> dict[str, Any]:
         "openai_api_key_set": bool(key),
         "openai_model": settings.get("openai_model", "whisper-1"),
         "translation_model": settings.get("translation_model", "gpt-4o-mini"),
-        "translation_chunk_size": int_setting("translation_chunk_size", 80),
+        "translation_chunk_size": int_setting("translation_chunk_size", 40),
         "price_per_minute_usd": float_setting("price_per_minute_usd", 0.006),
         "concurrency_limit": int_setting("concurrency_limit", 1),
         "overwrite_openai_outputs": bool_setting("overwrite_openai_outputs", False),
@@ -1478,7 +1512,7 @@ INDEX_HTML = """
           <div class="row">
             <label>Model:</label><input id="sModel" value="whisper-1">
             <label>Translate model:</label><input id="sTranslationModel" value="gpt-4o-mini">
-            <label>HR chunk size:</label><input id="sTransChunk" type="number" value="80" min="10" max="200" style="width:90px;">
+            <label>HR chunk size:</label><input id="sTransChunk" type="number" value="40" min="10" max="200" style="width:90px;">
             <label>USD/min:</label><input id="sPrice" type="number" step="0.0001" value="0.006">
             <label>Concurrency:</label><input id="sConc" type="number" value="1" min="1" max="4" style="width:80px;">
           </div>
@@ -1712,7 +1746,7 @@ INDEX_HTML = """
       document.getElementById("apiMask").innerText = s.openai_api_key_set ? `Stored key: ${s.openai_api_key_masked}` : "No API key saved";
       document.getElementById("sModel").value = s.openai_model || "whisper-1";
       document.getElementById("sTranslationModel").value = s.translation_model || "gpt-4o-mini";
-      document.getElementById("sTransChunk").value = s.translation_chunk_size ?? 80;
+      document.getElementById("sTransChunk").value = s.translation_chunk_size ?? 40;
       document.getElementById("sPrice").value = s.price_per_minute_usd ?? 0.006;
       document.getElementById("sConc").value = s.concurrency_limit ?? 1;
       document.getElementById("sOverwrite").checked = !!s.overwrite_openai_outputs;
@@ -1727,7 +1761,7 @@ INDEX_HTML = """
         openai_api_key: document.getElementById("sApiKey").value || null,
         openai_model: document.getElementById("sModel").value || "whisper-1",
         translation_model: document.getElementById("sTranslationModel").value || "gpt-4o-mini",
-        translation_chunk_size: parseInt(document.getElementById("sTransChunk").value || "80", 10),
+        translation_chunk_size: parseInt(document.getElementById("sTransChunk").value || "40", 10),
         price_per_minute_usd: parseFloat(document.getElementById("sPrice").value || "0.006"),
         concurrency_limit: parseInt(document.getElementById("sConc").value || "1", 10),
         overwrite_openai_outputs: document.getElementById("sOverwrite").checked,
