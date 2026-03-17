@@ -1,0 +1,26 @@
+services:
+  subtitle-transcribe-ui:
+    image: "${APP_IMAGE:-ghcr.io/raanh/subtitle-transcribe-ui:latest}"
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ:-Europe/Zagreb}"
+      APP_DATA_DIR: /data
+      MEDIA_ROOT_TV: /media/tv
+      MEDIA_ROOT_MOVIES: /media/movies
+      MEDIA_ROOT_ANIME: /media/anime
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    volumes:
+      - "${APP_HOST_PATH}:/data"
+      - "${TV_ROOT_PATH}:/media/tv:rw"
+      - "${MOVIES_ROOT_PATH}:/media/movies:rw"
+      - "${ANIME_ROOT_PATH}:/media/anime:rw"
+    ports:
+      - "${UI_PORT:-8787}:8080"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/roots', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 25s
