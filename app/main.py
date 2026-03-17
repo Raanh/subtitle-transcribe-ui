@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import imageio_ffmpeg
 from fastapi import FastAPI, HTTPException, Query
@@ -54,6 +55,7 @@ DEFAULT_SETTINGS = {
     "price_per_minute_usd": "0.006",
     "concurrency_limit": "1",
     "overwrite_openai_outputs": "0",
+    "keep_raw_openai": "0",
     "enable_ffsubsync": "1",
     "show_tv_root": "1",
     "show_movies_root": "1",
@@ -330,13 +332,21 @@ def subtitle_presence(video_path: Path) -> tuple[bool, bool, list[str], list[str
     return bool(en_hits), bool(hr_hits), en_hits, hr_hits
 
 
+def final_en_subtitle_path(video_path: Path) -> Path:
+    return Path(str(video_path.with_suffix("")) + ".openai.en.srt")
+
+
 def find_best_generated_en_subtitle(video_path: Path) -> Path | None:
     base = video_path.with_suffix("")
-    preferred = Path(str(base) + ".openai.synced.en.srt")
+    preferred = final_en_subtitle_path(video_path)
     if preferred.exists():
         return preferred
 
-    secondary = Path(str(base) + ".openai.en.srt")
+    legacy_synced = Path(str(base) + ".openai.synced.en.srt")
+    if legacy_synced.exists():
+        return legacy_synced
+
+    secondary = Path(str(base) + ".openai.raw.en.srt")
     if secondary.exists():
         return secondary
 
@@ -351,6 +361,18 @@ def find_best_generated_en_subtitle(video_path: Path) -> Path | None:
 
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates[0]
+
+
+def find_translation_source_subtitle(video_path: Path) -> Path | None:
+    final_path = final_en_subtitle_path(video_path)
+    if final_path.exists():
+        return final_path
+
+    # Backward compatibility with legacy naming from older runs.
+    legacy_synced = Path(str(video_path.with_suffix("")) + ".openai.synced.en.srt")
+    if legacy_synced.exists():
+        return legacy_synced
+    return None
 
 
 def parse_srt_entries(srt_text: str) -> list[dict[str, Any]]:
@@ -733,13 +755,13 @@ def complete_queue_item(queue_id: int, status: str, error_message: str | None = 
         conn.close()
 
 
-def build_output_path(video_path: Path, overwrite_openai: bool) -> Path:
+def build_raw_output_path(video_path: Path) -> Path:
     base = video_path.with_suffix("")
-    preferred = Path(str(base) + ".openai.en.srt")
-    if overwrite_openai or not preferred.exists():
+    preferred = Path(str(base) + ".openai.raw.en.srt")
+    if not preferred.exists():
         return preferred
     suffix = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path(str(base) + f".openai.{suffix}.en.srt")
+    return Path(str(base) + f".openai.raw.{suffix}.en.srt")
 
 
 def build_hr_output_path(video_path: Path, force_alternate: bool) -> tuple[Path, bool]:
@@ -756,7 +778,12 @@ def build_hr_output_path(video_path: Path, force_alternate: bool) -> tuple[Path,
     return Path(str(base) + f".openai.alt.{suffix}.hr.srt"), True
 
 
-def run_subtitle_sync(video_path: Path, input_srt: Path, logger: logging.Logger) -> Path | None:
+def run_subtitle_sync(
+    video_path: Path,
+    input_srt: Path,
+    synced_output_path: Path,
+    logger: logging.Logger,
+) -> Path | None:
     ffsubsync_bin = shutil.which("ffsubsync")
     if not ffsubsync_bin:
         logger.warning("ffsubsync not found in PATH, skipping sync stage")
@@ -773,14 +800,13 @@ def run_subtitle_sync(video_path: Path, input_srt: Path, logger: logging.Logger)
             ffmpeg_link.write_text(f"#!/bin/sh\nexec '{ffmpeg_bin}' \"$@\"\n", encoding="utf-8")
             ffmpeg_link.chmod(0o755)
 
-    synced_path = Path(str(video_path.with_suffix("")) + ".openai.synced.en.srt")
     cmd = [
         ffsubsync_bin,
         str(video_path),
         "-i",
         str(input_srt),
         "-o",
-        str(synced_path),
+        str(synced_output_path),
     ]
     env = os.environ.copy()
     env["PATH"] = f"{ffbin_dir}:{env.get('PATH', '')}"
@@ -788,16 +814,34 @@ def run_subtitle_sync(video_path: Path, input_srt: Path, logger: logging.Logger)
     if process.returncode != 0:
         details = (process.stderr or process.stdout or "").strip()
         raise RuntimeError(details or f"ffsubsync exited with {process.returncode}")
-    return synced_path
+    return synced_output_path
+
+
+def cleanup_legacy_en_artifacts(video_path: Path, logger: logging.Logger) -> None:
+    patterns = [
+        f"{video_path.stem}.openai.synced.en.srt",
+        f"{video_path.stem}.openai.bootcheck*.srt",
+        f"{video_path.stem}.openai.bootcheck*.en.srt",
+        f"{video_path.stem}.openai.bootcheck*.synced.en.srt",
+    ]
+    for pattern in patterns:
+        for path in video_path.parent.glob(pattern):
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+                logger.info("Removed legacy subtitle artifact: %s", path)
+            except Exception:
+                logger.warning("Failed to remove legacy subtitle artifact: %s", path)
 
 
 def process_translation_job(item: dict[str, Any], logger: logging.Logger) -> tuple[str, str, int]:
     queue_id = int(item["id"])
     video_path = Path(item["abs_path"])
     source_subtitle = item.get("source_subtitle_path") or ""
-    source_path = Path(source_subtitle) if source_subtitle else find_best_generated_en_subtitle(video_path)
+    source_path = Path(source_subtitle) if source_subtitle else find_translation_source_subtitle(video_path)
     if not source_path or not source_path.exists():
-        raise RuntimeError("Missing generated English subtitle (.openai.en.srt)")
+        raise RuntimeError("Missing synced English subtitle (.openai.en.srt)")
 
     settings = get_settings()
     api_key = settings.get("openai_api_key", "").strip()
@@ -860,7 +904,6 @@ def process_queue_item(item: dict[str, Any], logger: logging.Logger) -> None:
     queue_id = int(item["id"])
     video_path = Path(item["abs_path"])
     tmp_audio_path = TMP_DIR / f"q{queue_id}-{int(time.time())}.m4a"
-    synced_path: Path | None = None
     warning: str | None = None
 
     try:
@@ -926,24 +969,52 @@ def process_queue_item(item: dict[str, Any], logger: logging.Logger) -> None:
             raise RuntimeError("OpenAI returned empty subtitle output")
 
         update_queue_item(queue_id, status="writing srt", current_step="writing srt")
-        overwrite_openai = settings.get("overwrite_openai_outputs", "0") == "1"
-        output_path = build_output_path(video_path, overwrite_openai)
-        output_path.write_text(subtitle_text, encoding="utf-8")
-        update_queue_item(queue_id, output_subtitle_path=str(output_path))
+        raw_output_path = build_raw_output_path(video_path)
+        raw_output_path.write_text(subtitle_text, encoding="utf-8")
 
-        if settings.get("enable_ffsubsync", "1") == "1":
+        final_output_path = final_en_subtitle_path(video_path)
+        ffsubsync_enabled = settings.get("enable_ffsubsync", "1") == "1"
+        tmp_synced_output = TMP_DIR / f"q{queue_id}-{uuid4().hex}.synced.srt"
+
+        if ffsubsync_enabled:
             try:
                 update_queue_item(
                     queue_id,
                     status="writing srt",
                     current_step="writing srt (ffsubsync stage)",
                 )
-                synced_path = run_subtitle_sync(video_path, output_path, logger)
-                if synced_path:
-                    update_queue_item(queue_id, synced_subtitle_path=str(synced_path))
+                synced_path = run_subtitle_sync(video_path, raw_output_path, tmp_synced_output, logger)
+                if synced_path and synced_path.exists():
+                    synced_path.replace(final_output_path)
+                else:
+                    shutil.copyfile(raw_output_path, final_output_path)
             except Exception as sync_exc:
-                warning = f"ffsubsync failed: {sync_exc}"
+                warning = f"ffsubsync failed, kept raw timing: {sync_exc}"
                 logger.warning("Queue %s: %s", queue_id, warning)
+                shutil.copyfile(raw_output_path, final_output_path)
+            finally:
+                if tmp_synced_output.exists():
+                    try:
+                        tmp_synced_output.unlink()
+                    except Exception:
+                        pass
+        else:
+            shutil.copyfile(raw_output_path, final_output_path)
+
+        cleanup_legacy_en_artifacts(video_path, logger)
+
+        keep_raw = settings.get("keep_raw_openai", "0") == "1"
+        if not keep_raw and raw_output_path.exists():
+            try:
+                raw_output_path.unlink()
+            except Exception:
+                pass
+
+        update_queue_item(
+            queue_id,
+            output_subtitle_path=str(final_output_path),
+            synced_subtitle_path=str(final_output_path),
+        )
 
         complete_queue_item(queue_id, "completed", warning)
         logger.info("Queue %s completed: %s", queue_id, video_path)
@@ -1009,6 +1080,7 @@ class SettingsUpdate(BaseModel):
     price_per_minute_usd: float = 0.006
     concurrency_limit: int = 1
     overwrite_openai_outputs: bool = False
+    keep_raw_openai: bool = False
     enable_ffsubsync: bool = True
     show_tv_root: bool = True
     show_movies_root: bool = True
@@ -1090,6 +1162,7 @@ def api_get_settings() -> dict[str, Any]:
         "price_per_minute_usd": float_setting("price_per_minute_usd", 0.006),
         "concurrency_limit": int_setting("concurrency_limit", 1),
         "overwrite_openai_outputs": bool_setting("overwrite_openai_outputs", False),
+        "keep_raw_openai": bool_setting("keep_raw_openai", False),
         "enable_ffsubsync": bool_setting("enable_ffsubsync", True),
         "show_tv_root": bool_setting("show_tv_root", True),
         "show_movies_root": bool_setting("show_movies_root", True),
@@ -1108,6 +1181,7 @@ def api_save_settings(payload: SettingsUpdate) -> dict[str, Any]:
     save_setting("price_per_minute_usd", f"{max(payload.price_per_minute_usd, 0.0):.6f}")
     save_setting("concurrency_limit", str(max(payload.concurrency_limit, 1)))
     save_setting("overwrite_openai_outputs", "1" if payload.overwrite_openai_outputs else "0")
+    save_setting("keep_raw_openai", "1" if payload.keep_raw_openai else "0")
     save_setting("enable_ffsubsync", "1" if payload.enable_ffsubsync else "0")
     save_setting("show_tv_root", "1" if payload.show_tv_root else "0")
     save_setting("show_movies_root", "1" if payload.show_movies_root else "0")
@@ -1151,7 +1225,7 @@ def api_browse(
             continue
 
         has_en_sub, has_hr_sub, en_files, hr_files = subtitle_presence(entry)
-        generated_en = find_best_generated_en_subtitle(entry)
+        generated_en = find_translation_source_subtitle(entry)
         if no_en and has_en_sub:
             continue
         if has_en and not has_en_sub:
@@ -1283,9 +1357,9 @@ def api_queue_add_translate_hr(payload: AddHrTranslationRequest) -> dict[str, An
             continue
 
         _, has_hr_sub, _, hr_files = subtitle_presence(video)
-        source_en = find_best_generated_en_subtitle(video)
+        source_en = find_translation_source_subtitle(video)
         if not source_en:
-            skipped_missing_en.append({"rel_path": item.rel_path, "reason": "missing_generated_en"})
+            skipped_missing_en.append({"rel_path": item.rel_path, "reason": "missing_synced_en"})
             continue
 
         if has_hr_sub and not payload.confirm_existing_hr:
@@ -1428,6 +1502,9 @@ INDEX_HTML = """
       --border: #30415f;
     }
     body { margin:0; font-family: ui-sans-serif, system-ui, sans-serif; background: linear-gradient(180deg,#101a2a,#0d1320); color:var(--text); }
+    a { color: #9ed3ff; text-decoration: none; }
+    a:hover { color: #dff1ff; text-decoration: underline; }
+    a:visited { color: #b4dcff; }
     .wrap { padding: 14px; display:grid; grid-template-columns: 1.4fr 1fr; gap: 12px; }
     .panel { background: var(--panel); border:1px solid var(--border); border-radius: 10px; padding: 12px; }
     h2 { margin: 0 0 10px; font-size: 18px; }
@@ -1435,6 +1512,7 @@ INDEX_HTML = """
     button { background: var(--panel2); color: var(--text); border:1px solid var(--border); border-radius:8px; padding: 6px 10px; cursor:pointer; }
     button:hover { border-color: var(--accent); }
     input, select { background: #0d1524; border:1px solid var(--border); color: var(--text); border-radius:6px; padding: 6px 8px; }
+    ::placeholder { color: #9ab4d8; }
     .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
     .muted { color: var(--muted); font-size: 12px; }
     .badge { padding: 2px 6px; border-radius: 999px; font-size: 11px; font-weight: 600; }
@@ -1535,6 +1613,7 @@ INDEX_HTML = """
           </div>
           <div class="row">
             <label><input type="checkbox" id="sOverwrite"> Overwrite existing .openai output</label>
+            <label><input type="checkbox" id="sKeepRaw"> Keep .openai.raw.en.srt (debug)</label>
             <label><input type="checkbox" id="sSync" checked> Run ffsubsync after transcription</label>
           </div>
           <div class="row">
@@ -1678,7 +1757,7 @@ INDEX_HTML = """
       const rel = decodeURIComponent(relEnc);
       const file = currentFiles.find(f => f.rel_path === rel);
       if(!file || !file.has_generated_en_subtitle){
-        alert("Generated EN subtitle (.openai.en.srt/.openai.synced.en.srt) is required first.");
+        alert("Synced EN subtitle (.openai.en.srt) is required first.");
         return;
       }
       let confirmExistingHr = false;
@@ -1767,6 +1846,7 @@ INDEX_HTML = """
       document.getElementById("sPrice").value = s.price_per_minute_usd ?? 0.006;
       document.getElementById("sConc").value = s.concurrency_limit ?? 1;
       document.getElementById("sOverwrite").checked = !!s.overwrite_openai_outputs;
+      document.getElementById("sKeepRaw").checked = !!s.keep_raw_openai;
       document.getElementById("sSync").checked = !!s.enable_ffsubsync;
       document.getElementById("sShowTv").checked = !!s.show_tv_root;
       document.getElementById("sShowMovies").checked = !!s.show_movies_root;
@@ -1782,6 +1862,7 @@ INDEX_HTML = """
         price_per_minute_usd: parseFloat(document.getElementById("sPrice").value || "0.006"),
         concurrency_limit: parseInt(document.getElementById("sConc").value || "1", 10),
         overwrite_openai_outputs: document.getElementById("sOverwrite").checked,
+        keep_raw_openai: document.getElementById("sKeepRaw").checked,
         enable_ffsubsync: document.getElementById("sSync").checked,
         show_tv_root: document.getElementById("sShowTv").checked,
         show_movies_root: document.getElementById("sShowMovies").checked,

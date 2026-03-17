@@ -8,8 +8,9 @@ Manual, queue-based OpenAI subtitle transcription UI.
 - Manual file/folder selection only
 - Cost estimate before queueing
 - Queue statuses + history
-- Output `.openai.en.srt` next to media file
-- Optional `ffsubsync` stage to create `.openai.synced.en.srt`
+- Raw EN stage: `.openai.raw.en.srt` (optional keep for debugging)
+- Final EN stage: `.openai.en.srt` (primary subtitle for Plex)
+- ffsubsync runs from raw and writes final synced EN without leaving `.synced.*` artifacts
 - Manual `Translate to HR` from generated EN subtitles (`.openai.hr.srt` / safe `.openai.alt.hr.srt`)
 
 ## Stack files
