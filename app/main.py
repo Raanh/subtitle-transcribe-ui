@@ -985,7 +985,7 @@ def process_queue_item(item: dict[str, Any], logger: logging.Logger) -> None:
                 )
                 synced_path = run_subtitle_sync(video_path, raw_output_path, tmp_synced_output, logger)
                 if synced_path and synced_path.exists():
-                    synced_path.replace(final_output_path)
+                    shutil.move(str(synced_path), str(final_output_path))
                 else:
                     shutil.copyfile(raw_output_path, final_output_path)
             except Exception as sync_exc:
