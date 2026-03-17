@@ -3,3 +3,4 @@ uvicorn[standard]==0.35.0
 openai==2.28.0
 imageio-ffmpeg==0.6.0
 ffsubsync==0.4.29
+setuptools==80.9.0
